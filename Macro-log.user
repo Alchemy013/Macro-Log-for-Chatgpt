@@ -1,0 +1,790 @@
+// ==UserScript==
+// @name         Rehyann Macro Log
+// @namespace    rehyann.macrolog
+// @version      1.0.0
+// @description  Log food + grams, let ChatGPT calculate the macros, and track daily / weekly / monthly totals in a side panel on chatgpt.com.
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+(function () {
+  'use strict';
+  if (window.__mtLoaded) return;
+  window.__mtLoaded = true;
+
+  const CONFIG = {
+    composer: '#prompt-textarea, div.ProseMirror[contenteditable="true"], textarea[data-testid="prompt-textarea"]',
+    sendButton: '[data-testid="send-button"], button[data-testid="composer-send-button"], button[aria-label="Send prompt"]',
+    stopButton: '[data-testid="stop-button"], button[aria-label*="Stop"]',
+    assistantMsg: '[data-message-author-role="assistant"]',
+    replyTimeoutMs: 90000,
+  };
+
+  const ENTRIES_KEY = 'mt_entries_v1';
+  const GOALS_KEY = 'mt_goals_v1';
+  const OPEN_KEY = 'mt_open_v1';
+  const DEFAULT_GOALS = { calories: 2200, protein: 160, carbs: 220, fat: 70 };
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+  let shadow = null;
+  const q = (sel) => (shadow ? shadow.querySelector(sel) : null);
+  const qa = (sel) => (shadow ? [...shadow.querySelectorAll(sel)] : []);
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const pad = (n) => String(n).padStart(2, '0');
+  const round1 = (n) => Math.round(n * 10) / 10;
+  const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
+  const nf = (n) => Math.round(n).toLocaleString('en-IN');
+  const esc = (s) =>
+    String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  const dateKey = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const parseKey = (k) => {
+    const [y, m, d] = k.split('-').map(Number);
+    return new Date(y, m - 1, d);
+  };
+  const addDays = (d, n) => {
+    const x = new Date(d);
+    x.setDate(x.getDate() + n);
+    return x;
+  };
+  const fmtNice = (d) => d.toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' });
+
+  const loadEntries = () => {
+    try { return JSON.parse(localStorage.getItem(ENTRIES_KEY)) || []; } catch { return []; }
+  };
+  const saveEntries = (list) => localStorage.setItem(ENTRIES_KEY, JSON.stringify(list));
+  const loadGoals = () => {
+    try { return { ...DEFAULT_GOALS, ...(JSON.parse(localStorage.getItem(GOALS_KEY)) || {}) }; }
+    catch { return { ...DEFAULT_GOALS }; }
+  };
+  const saveGoals = (g) => localStorage.setItem(GOALS_KEY, JSON.stringify(g));
+
+  const entriesOn = (key) => loadEntries().filter((e) => e.date === key);
+  const totalsFor = (entries) =>
+    entries.reduce(
+      (a, e) => ({
+        calories: a.calories + (e.calories || 0),
+        protein: a.protein + (e.protein || 0),
+        carbs: a.carbs + (e.carbs || 0),
+        fat: a.fat + (e.fat || 0),
+        fiber: a.fiber + (e.fiber || 0),
+      }),
+      { calories: 0, protein: 0, carbs: 0, fat: 0, fiber: 0 }
+    );
+
+  const getComposer = () => $(CONFIG.composer);
+  const isStreaming = () => !!$(CONFIG.stopButton);
+  const assistantMessages = () => $$(CONFIG.assistantMsg);
+
+  function setComposerText(el, text) {
+    el.focus();
+    if (el.tagName === 'TEXTAREA') {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(el, text);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    } else {
+      const sel = window.getSelection();
+      sel.selectAllChildren(el);
+      document.execCommand('insertText', false, text);
+    }
+  }
+
+  async function clickSendWithRetry() {
+    for (let i = 0; i < 8; i++) {
+      const btn = $(CONFIG.sendButton);
+      if (btn && !btn.disabled) {
+        btn.click();
+        return true;
+      }
+      await sleep(400);
+    }
+    const composer = getComposer();
+    if (composer) {
+      composer.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true })
+      );
+      return true;
+    }
+    return false;
+  }
+
+  async function askChatGPT(prompt) {
+    const composer = getComposer();
+    if (!composer) throw new Error('ChatGPT input not found — open a conversation first.');
+
+    for (let i = 0; i < 20 && isStreaming(); i++) await sleep(500);
+
+    const before = assistantMessages().length;
+    setComposerText(composer, prompt);
+    await sleep(300);
+    const sent = await clickSendWithRetry();
+    if (!sent) throw new Error('Could not press Send — selectors may need updating.');
+
+    const t0 = Date.now();
+    let lastText = '';
+    let stable = 0;
+    while (Date.now() - t0 < CONFIG.replyTimeoutMs) {
+      await sleep(700);
+      const msgs = assistantMessages();
+      if (msgs.length <= before) continue;
+      const txt = (msgs[msgs.length - 1].innerText || '').trim();
+      if (!txt || isStreaming() || txt !== lastText) {
+        lastText = txt;
+        stable = 0;
+        continue;
+      }
+      stable += 1;
+      if (stable >= 2) return txt;
+    }
+    throw new Error('Timed out waiting for the ChatGPT reply.');
+  }
+
+  function buildPrompt(food, grams) {
+    const amount = grams > 0 ? `${grams} g` : 'one standard serving (estimate the weight in grams yourself)';
+    return [
+      `Nutrition lookup for a macro tracker. Food: "${food}". Amount: ${amount}.`,
+      'Assume the most common preparation (Indian context where relevant).',
+      'Reply with ONLY one raw JSON object on a single line — no markdown, no code fences, no explanation:',
+      '{"food":"short name","grams":number,"calories":number,"protein":number,"carbs":number,"fat":number,"fiber":number}',
+      'All values scaled to the stated amount. Plain numbers only (no units), max 1 decimal place.',
+    ].join('\n');
+  }
+
+  function extractMacros(text) {
+    const cleaned = text.replace(/```json|```/gi, '');
+    const match = cleaned.match(/\{[\s\S]*?\}/);
+    if (!match) return null;
+    let obj;
+    try { obj = JSON.parse(match[0]); } catch { return null; }
+    const num = (v) => {
+      const n = parseFloat(String(v).replace(/[^\d.\-]/g, ''));
+      return Number.isFinite(n) ? round1(n) : 0;
+    };
+    const food = cap(String(obj.food || '').trim().slice(0, 60));
+    if (!food) return null;
+    return {
+      food,
+      grams: num(obj.grams),
+      calories: num(obj.calories),
+      protein: num(obj.protein),
+      carbs: num(obj.carbs),
+      fat: num(obj.fat),
+      fiber: num(obj.fiber),
+    };
+  }
+
+  const ui = {
+    tab: 'today',
+    viewDate: dateKey(new Date()),
+    busy: false,
+    status: null,
+  };
+
+  const setStatus = (text, cls) => {
+    ui.status = text ? { text, cls } : null;
+    const el = q('#mt-status');
+    if (el) {
+      el.className = 'mt-status' + (cls ? ' ' + cls : '');
+      el.innerHTML = (cls === 'busy' ? '<span class="mt-spin"></span>' : '') + esc(text || '');
+    }
+  };
+
+  const CSS = `
+:host{all:initial}
+*{box-sizing:border-box;margin:0;padding:0}
+button{cursor:pointer;font:inherit;color:inherit;background:none;border:none;-webkit-appearance:none}
+input{font:inherit;color:inherit;background:none;border:none;outline:none;-webkit-appearance:none}
+button:focus-visible,input:focus-visible{outline:2px solid #FFB454;outline-offset:2px}
+
+#mt-pill,#mt-panel{
+  --ink:#0E0F13;--bg:#12131A;--card:#1D2029;--deep:#0B0C11;
+  --line:rgba(238,241,248,.09);--line2:rgba(238,241,248,.16);
+  --text:#EEF0F6;--muted:#8E93A3;
+  --cal:#FFB454;--pro:#7BE0AD;--carb:#6FB7FF;--fat:#F49FBC;--err:#FF8A8A;
+  --font:"Söhne",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  --mono:"Söhne Mono",ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace;
+  font-family:var(--font);
+}
+
+#mt-pill{
+  position:fixed;right:18px;bottom:18px;z-index:2147483000;
+  display:flex;align-items:center;gap:8px;
+  background:rgba(11,12,17,.92);backdrop-filter:blur(14px) saturate(1.3);
+  border:1px solid rgba(255,180,84,.5);color:var(--cal);
+  font:600 11px/1 var(--mono);letter-spacing:.16em;text-transform:uppercase;
+  padding:12px 17px 12px 14px;border-radius:999px;
+  box-shadow:0 6px 24px rgba(0,0,0,.5),0 0 0 4px rgba(255,180,84,.06);
+  transition:transform .15s ease,box-shadow .15s ease;
+}
+#mt-pill:hover{transform:translateY(-1px);box-shadow:0 8px 28px rgba(0,0,0,.55),0 0 0 4px rgba(255,180,84,.12)}
+.pillring{width:11px;height:11px;border-radius:50%;border:3px solid currentColor;flex-shrink:0}
+
+#mt-panel{
+  position:fixed;right:16px;bottom:74px;width:352px;
+  max-height:min(700px,calc(100vh - 112px));
+  display:none;flex-direction:column;z-index:2147483000;
+  background:
+    radial-gradient(150% 110px at 50% 0%,rgba(255,180,84,.08),transparent 70%),
+    linear-gradient(180deg,#14151C,#101118);
+  color:var(--text);
+  border:1px solid var(--line2);border-radius:22px;overflow:hidden;
+  font-size:13.5px;line-height:1.5;
+  box-shadow:0 28px 70px rgba(0,0,0,.65),0 2px 10px rgba(0,0,0,.4);
+}
+
+.head{display:flex;align-items:center;justify-content:space-between;padding:15px 15px 11px 17px}
+.brand{display:flex;align-items:center;gap:10px}
+.brandring{width:13px;height:13px;border-radius:50%;border:3.5px solid var(--cal);box-shadow:0 0 12px rgba(255,180,84,.4)}
+.title{font:800 12px/1 var(--mono);letter-spacing:.24em;color:var(--text)}
+.subtitle{font:600 7.5px/1 var(--mono);letter-spacing:.34em;color:var(--muted);margin-top:4px}
+.xbtn{color:var(--muted);font-size:14px;width:28px;height:28px;border-radius:9px;display:flex;align-items:center;justify-content:center}
+.xbtn:hover{color:var(--text);background:var(--card)}
+
+.tabs{display:flex;gap:3px;margin:0 15px 8px;background:var(--deep);padding:4px;border-radius:13px;border:1px solid var(--line)}
+.tabs button{flex:1;padding:8px 0;border-radius:10px;font-size:12px;font-weight:600;color:var(--muted);letter-spacing:.02em;transition:color .15s,background .15s}
+.tabs button:hover{color:var(--text)}
+.tabs button.active{background:#2A2E3A;color:var(--text);box-shadow:0 1px 6px rgba(0,0,0,.45)}
+
+.body{overflow-y:auto;overflow-x:hidden;padding:8px 15px 17px;display:flex;flex-direction:column;gap:12px}
+.body::-webkit-scrollbar{width:8px}
+.body::-webkit-scrollbar-thumb{background:var(--card);border-radius:4px}
+
+.datenav{display:flex;align-items:center;justify-content:space-between;padding:0 2px}
+.datenav>div{font-weight:600;font-size:13.5px}
+.datenav>div em{font-style:normal;color:var(--cal)}
+.datenav button{width:30px;height:30px;border-radius:10px;background:var(--card);border:1px solid var(--line);color:var(--muted);font-size:16px;line-height:1;display:flex;align-items:center;justify-content:center}
+.datenav button:hover:not(:disabled){color:var(--text);border-color:var(--line2)}
+.datenav button:disabled{opacity:.3;cursor:default}
+
+.composer{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:7px 7px 7px 14px;transition:border-color .15s}
+.composer:focus-within{border-color:rgba(255,180,84,.6)}
+#mt-food{flex:1;min-width:0;font-size:13.5px}
+#mt-food::placeholder{color:var(--muted)}
+.gwrap{display:flex;align-items:center;gap:3px;background:var(--deep);border-radius:10px;padding:6px 9px;flex-shrink:0}
+#mt-grams{width:38px;text-align:right;font:600 12.5px var(--mono)}
+input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield;appearance:textfield}
+#mt-grams::placeholder{color:var(--muted)}
+.gwrap span{font:500 11px var(--mono);color:var(--muted)}
+.addbtn{width:34px;height:34px;flex-shrink:0;border-radius:50%;background:var(--cal);color:var(--ink);display:flex;align-items:center;justify-content:center;transition:transform .12s,filter .12s;box-shadow:0 2px 10px rgba(255,180,84,.3)}
+.addbtn svg{width:15px;height:15px}
+.addbtn:hover:not(:disabled){transform:scale(1.07);filter:brightness(1.07)}
+.addbtn:disabled{opacity:.5;cursor:default}
+
+.mt-status{min-height:17px;font-size:11.5px;color:var(--muted);padding:0 3px;display:flex;align-items:center}
+.mt-status.busy{color:var(--cal)}
+.mt-status.ok{color:var(--pro)}
+.mt-status.err{color:var(--err)}
+.mt-spin{width:10px;height:10px;border:2px solid rgba(255,180,84,.25);border-top-color:var(--cal);border-radius:50%;display:inline-block;margin-right:7px;animation:rot .8s linear infinite;flex-shrink:0}
+@keyframes rot{to{transform:rotate(360deg)}}
+
+.hero{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:15px 15px 13px}
+.hero-main{display:flex;align-items:center;gap:16px}
+.rings{flex-shrink:0;display:block}
+.ring-track{fill:none;stroke:rgba(238,241,248,.06)}
+.ring-fill{fill:none;stroke-linecap:round;transform:rotate(-90deg);transform-origin:60px 60px;transition:stroke-dashoffset .5s ease}
+.rf-cal{stroke:var(--cal)} .rf-pro{stroke:var(--pro)}
+.ring-fill.over{filter:brightness(1.25) saturate(1.35)}
+.ring-num{font:700 19px var(--mono);fill:var(--text)}
+.ring-num.over{fill:var(--cal)}
+.ring-lab{font:600 7.5px var(--mono);letter-spacing:.22em;fill:var(--muted)}
+
+.hero-right{flex:1;min-width:0;display:flex;flex-direction:column;gap:13px}
+.hb-top{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.d-cal{background:var(--cal)} .d-pro{background:var(--pro)}
+.d-carb{background:var(--carb)} .d-fat{background:var(--fat)}
+.hb-val{font:700 19px/1.15 var(--mono);margin-top:4px}
+.hb-val i{font:500 12px var(--mono);font-style:normal;color:var(--muted)}
+.hb-sub{font:500 10.5px var(--mono);color:var(--muted);margin-top:3px}
+.hb-sub .ov{color:var(--cal)}
+.hb-sub .hit{color:var(--pro)}
+
+.hero-div{height:1px;background:var(--line);margin:13px 0 12px}
+.mini2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.mini-top{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--muted);font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+.mini-top b{margin-left:auto;font:600 11px var(--mono);color:var(--text)}
+.mini-top b i{font-style:normal;font-weight:500;color:var(--muted)}
+.track{height:6px;background:rgba(0,0,0,.45);border-radius:99px;overflow:hidden;margin-top:6px}
+.fill{height:100%;border-radius:99px;transition:width .35s ease}
+.fill.over{filter:brightness(1.25) saturate(1.35)}
+.c-carb{background:var(--carb)} .c-fat{background:var(--fat)}
+
+.emptybox{border:1px dashed var(--line2);border-radius:16px;padding:14px;text-align:center}
+.emptybox p{font-size:12px;color:var(--muted);margin-bottom:10px}
+.sugg{display:flex;flex-wrap:wrap;gap:6px;justify-content:center}
+.chipbtn{background:var(--deep);border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:11.5px;color:var(--text);transition:border-color .15s,color .15s}
+.chipbtn:hover{border-color:rgba(255,180,84,.6);color:var(--cal)}
+
+.entries{display:flex;flex-direction:column;gap:7px}
+.entry{display:flex;justify-content:space-between;gap:10px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:10px 12px;transition:border-color .15s}
+.entry:hover{border-color:var(--line2)}
+.e-name{font-weight:600;font-size:13px;display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.chip{font:500 10px var(--mono);color:var(--muted);background:var(--deep);border-radius:7px;padding:2px 7px}
+.e-macros{font:500 11px var(--mono);color:var(--muted);margin-top:5px}
+.e-macros b{color:var(--text);font-weight:700}
+.e-macros i{font-style:normal;font-weight:700;margin:0 2px 0 8px}
+.e-macros i.p{color:var(--pro)} .e-macros i.c{color:var(--carb)} .e-macros i.f{color:var(--fat)}
+.e-side{display:flex;flex-direction:column;align-items:flex-end;justify-content:space-between;gap:4px;flex-shrink:0}
+.e-side>span{font:500 10px var(--mono);color:var(--muted)}
+.delbtn{color:var(--muted);font-size:11px;width:22px;height:22px;border-radius:7px;display:flex;align-items:center;justify-content:center}
+.delbtn:hover{color:var(--err);background:rgba(255,138,138,.1)}
+
+.sect{font:600 10px var(--mono);color:var(--muted);letter-spacing:.18em;text-transform:uppercase;padding:0 2px}
+.stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 8px;text-align:center}
+.stat b{display:block;font:700 17px var(--mono);margin-bottom:3px}
+.stat span{font-size:9.5px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}
+.stat.pro b{color:var(--pro)}
+.stat.cal b{color:var(--cal)}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:14px}
+.wvals,.cols7,.wmeta{display:grid;grid-template-columns:repeat(7,1fr);gap:7px}
+.wvals span{text-align:center;font:600 9.5px var(--mono);color:var(--muted);height:13px}
+.wvals span.tdy{color:var(--text)}
+.barsarea{position:relative;height:96px;margin-top:3px}
+.goalline{position:absolute;left:0;right:0;border-top:1px dashed rgba(255,180,84,.55);z-index:1;pointer-events:none}
+.goaltag{position:absolute;right:0;font:600 8px var(--mono);letter-spacing:.12em;color:rgba(255,180,84,.8);text-transform:uppercase;pointer-events:none}
+.cols7{height:100%}
+.wbarwrap{display:flex;align-items:flex-end;height:100%}
+.wbar{width:100%;min-height:2px;border-radius:6px 6px 2px 2px;background:linear-gradient(180deg,rgba(255,180,84,.95),rgba(255,180,84,.35))}
+.wbarwrap.tdy .wbar{background:linear-gradient(180deg,#FFDA9F,var(--cal));box-shadow:0 0 14px rgba(255,180,84,.3)}
+.wmeta{margin-top:8px}
+.wm{display:flex;flex-direction:column;align-items:center;gap:5px}
+.pdot{width:5px;height:5px;border-radius:99px;background:var(--pro);box-shadow:0 0 6px rgba(123,224,173,.5)}
+.pdot.off{background:rgba(238,241,248,.12);box-shadow:none}
+.wlab{font:600 9.5px var(--mono);color:var(--muted)}
+.wm.tdy .wlab{color:var(--cal)}
+.legend{font-size:10.5px;color:var(--muted);line-height:1.6;margin-top:11px}
+.legend i{font-style:normal}
+.legend .lg-cal{color:var(--cal)} .legend .lg-pro{color:var(--pro)}
+
+.cal7{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.cal7 header{text-align:center;font:600 9px var(--mono);color:var(--muted);letter-spacing:.06em;padding-bottom:3px}
+.cell{aspect-ratio:1;border-radius:10px;border:1px solid var(--line);background:linear-gradient(0deg,rgba(255,180,84,var(--a,0)),rgba(255,180,84,var(--a,0))),var(--deep);display:flex;align-items:center;justify-content:center;transition:transform .1s}
+.cell:hover:not(:disabled){transform:scale(1.08);border-color:var(--line2);z-index:1}
+.cell span{font:600 10px var(--mono);color:var(--muted)}
+.cell.logged span{color:var(--ink);font-weight:700}
+.cell.logged.faint span{color:var(--text)}
+.cell.hit{box-shadow:inset 0 0 0 1.5px var(--pro)}
+.cell.today{outline:1.5px solid rgba(238,241,248,.9);outline-offset:1.5px}
+.cell.future{opacity:.3;pointer-events:none}
+.cell:disabled{cursor:default}
+
+.btn{display:block;width:100%;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:11px 12px;font-size:12.5px;font-weight:600;text-align:center;transition:border-color .15s}
+.btn:hover{border-color:rgba(255,180,84,.55)}
+.btn.primary{background:var(--cal);color:var(--ink);border-color:transparent}
+.btn.primary:hover{filter:brightness(1.06)}
+.btn.danger{color:var(--err)}
+.btn.danger:hover{border-color:var(--err)}
+
+.goalgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.goalgrid label{display:flex;flex-direction:column;gap:6px}
+.gl{display:flex;align-items:center;gap:7px;font-size:10.5px;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+.gfield{position:relative}
+.gfield input{width:100%;background:var(--card);border:1px solid var(--line);border-radius:11px;padding:10px 44px 10px 12px;font:600 14px var(--mono)}
+.gfield input:focus{border-color:rgba(255,180,84,.6)}
+.gfield b{position:absolute;right:12px;top:50%;transform:translateY(-50%);font:500 10px var(--mono);color:var(--muted)}
+.note{font-size:11.5px;color:var(--muted);line-height:1.6;padding:0 2px}
+
+@media (prefers-reduced-motion:reduce){
+  *{transition:none !important;animation:none !important}
+}
+`;
+
+  function ringGauge(cal, calGoal, pro, proGoal) {
+    const R1 = 52, R2 = 39, SW = 9;
+    const c1 = 2 * Math.PI * R1, c2 = 2 * Math.PI * R2;
+    const p1 = calGoal > 0 ? Math.min(1, cal / calGoal) : 0;
+    const p2 = proGoal > 0 ? Math.min(1, pro / proGoal) : 0;
+    const rem = calGoal - cal;
+    const centerNum = rem >= 0 ? nf(rem) : nf(-rem);
+    const centerLab = rem >= 0 ? 'KCAL LEFT' : 'KCAL OVER';
+    return `
+    <svg class="rings" viewBox="0 0 120 120" width="118" height="118" aria-hidden="true">
+      <circle cx="60" cy="60" r="${R1}" class="ring-track" stroke-width="${SW}"/>
+      <circle cx="60" cy="60" r="${R2}" class="ring-track" stroke-width="${SW}"/>
+      <circle cx="60" cy="60" r="${R1}" class="ring-fill rf-cal ${cal > calGoal ? 'over' : ''}" stroke-width="${SW}"
+        stroke-dasharray="${c1.toFixed(1)}" stroke-dashoffset="${(c1 * (1 - p1)).toFixed(1)}"/>
+      <circle cx="60" cy="60" r="${R2}" class="ring-fill rf-pro ${pro > proGoal ? 'over' : ''}" stroke-width="${SW}"
+        stroke-dasharray="${c2.toFixed(1)}" stroke-dashoffset="${(c2 * (1 - p2)).toFixed(1)}"/>
+      <text x="60" y="59" text-anchor="middle" class="ring-num ${rem < 0 ? 'over' : ''}">${centerNum}</text>
+      <text x="60" y="74" text-anchor="middle" class="ring-lab">${centerLab}</text>
+    </svg>`;
+  }
+
+  function heroHtml(t, g) {
+    const remP = g.protein - t.protein;
+    const remC = g.calories - t.calories;
+    const block = (dot, name, valHtml, sub) => `
+      <div>
+        <div class="hb-top"><span class="dot ${dot}"></span>${name}</div>
+        <div class="hb-val">${valHtml}</div>
+        <div class="hb-sub">${sub}</div>
+      </div>`;
+    const mini = (name, dot, barCls, val, goal) => `
+      <div>
+        <div class="mini-top"><span class="dot ${dot}"></span><span>${name}</span>
+          <b>${Math.round(val)}<i> /${goal}g</i></b></div>
+        <div class="track"><div class="fill ${barCls} ${val > goal ? 'over' : ''}" style="width:${goal > 0 ? Math.min(100, (val / goal) * 100) : 0}%"></div></div>
+      </div>`;
+    return `
+      <div class="hero">
+        <div class="hero-main">
+          ${ringGauge(t.calories, g.calories, t.protein, g.protein)}
+          <div class="hero-right">
+            ${block('d-cal', 'Calories',
+              `${nf(t.calories)}<i> / ${nf(g.calories)}</i>`,
+              remC >= 0 ? `${nf(remC)} left` : `<span class="ov">${nf(-remC)} over</span>`)}
+            ${block('d-pro', 'Protein',
+              `${Math.round(t.protein)}g<i> / ${g.protein}</i>`,
+              remP > 0 ? `${Math.round(remP)}g to go` : `<span class="hit">goal hit ✓</span>`)}
+          </div>
+        </div>
+        <div class="hero-div"></div>
+        <div class="mini2">
+          ${mini('Carbs', 'd-carb', 'c-carb', t.carbs, g.carbs)}
+          ${mini('Fat', 'd-fat', 'c-fat', t.fat, g.fat)}
+        </div>
+      </div>`;
+  }
+
+  const entryHtml = (e) => `
+    <div class="entry">
+      <div style="min-width:0">
+        <div class="e-name">${esc(cap(e.food))}<span class="chip">${e.grams} g</span></div>
+        <div class="e-macros"><b>${nf(e.calories)}</b> kcal<i class="p">P</i>${round1(e.protein)}<i class="c">C</i>${round1(e.carbs)}<i class="f">F</i>${round1(e.fat)}</div>
+      </div>
+      <div class="e-side">
+        <span>${e.time || ''}</span>
+        <button class="delbtn" data-action="del" data-id="${e.id}" title="Delete entry">✕</button>
+      </div>
+    </div>`;
+
+  const SUGGESTIONS = [
+    { l: '2 rotis', f: '2 rotis', g: '' },
+    { l: 'dal tadka · 150g', f: 'dal tadka', g: '150' },
+    { l: 'paneer · 100g', f: 'paneer', g: '100' },
+    { l: '1 scoop whey', f: 'whey protein, 1 scoop', g: '' },
+  ];
+
+  function renderToday() {
+    const key = ui.viewDate;
+    const d = parseKey(key);
+    const isToday = key === dateKey(new Date());
+    const entries = entriesOn(key).sort((a, b) => (a.time || '').localeCompare(b.time || ''));
+    const t = totalsFor(entries);
+    const g = loadGoals();
+    const st = ui.status || { text: '', cls: '' };
+    const list = entries.length
+      ? `<div class="entries">${entries.map(entryHtml).join('')}</div>`
+      : `<div class="emptybox">
+           <p>Nothing logged for this day — try one:</p>
+           <div class="sugg">${SUGGESTIONS.map(
+             (s) => `<button class="chipbtn" data-action="prefill" data-food="${esc(s.f)}" data-grams="${s.g}">${esc(s.l)}</button>`
+           ).join('')}</div>
+         </div>`;
+    return `
+      <div class="datenav">
+        <button data-action="day" data-delta="-1" title="Previous day">‹</button>
+        <div>${isToday ? '<em>Today</em> · ' : ''}${fmtNice(d)}</div>
+        <button data-action="day" data-delta="1" ${isToday ? 'disabled' : ''} title="Next day">›</button>
+      </div>
+      <div class="composer">
+        <input id="mt-food" type="text" placeholder="Add food… e.g. rajma rice, one bowl" autocomplete="off"/>
+        <div class="gwrap"><input id="mt-grams" type="number" min="1" placeholder="—" title="Grams (leave empty to let ChatGPT estimate a serving)"/><span>g</span></div>
+        <button class="addbtn" data-action="add" ${ui.busy ? 'disabled' : ''} title="Add">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+        </button>
+      </div>
+      <div class="mt-status ${st.cls}" id="mt-status">${st.cls === 'busy' ? '<span class="mt-spin"></span>' : ''}${esc(st.text)}</div>
+      ${heroHtml(t, g)}
+      ${list}`;
+  }
+
+  function renderWeek() {
+    const today = new Date();
+    const g = loadGoals();
+    const days = [...Array(7)].map((_, i) => addDays(today, i - 6));
+    const data = days.map((d, i) => {
+      const es = entriesOn(dateKey(d));
+      return { d, t: totalsFor(es), logged: es.length > 0, tdy: i === 6 };
+    });
+    const maxCal = Math.max(g.calories, ...data.map((x) => x.t.calories), 1);
+    const goalPct = (g.calories / maxCal) * 100;
+
+    const vals = data.map((x) => `<span class="${x.tdy ? 'tdy' : ''}">${x.logged ? nf(x.t.calories) : ''}</span>`).join('');
+    const bars = data
+      .map(
+        (x) => `
+      <div class="wbarwrap ${x.tdy ? 'tdy' : ''}" title="${fmtNice(x.d)} — ${nf(x.t.calories)} kcal, ${Math.round(x.t.protein)}g protein">
+        <div class="wbar" style="height:${(x.t.calories / maxCal) * 100}%"></div>
+      </div>`
+      )
+      .join('');
+    const meta = data
+      .map(
+        (x) => `
+      <div class="wm ${x.tdy ? 'tdy' : ''}">
+        <span class="pdot ${x.logged && x.t.protein >= g.protein ? '' : 'off'}"></span>
+        <span class="wlab">${'SMTWTFS'[x.d.getDay()]}</span>
+      </div>`
+      )
+      .join('');
+
+    const logged = data.filter((x) => x.logged);
+    const avg = (f) => (logged.length ? Math.round(logged.reduce((s, x) => s + x.t[f], 0) / logged.length) : 0);
+    const proteinHits = data.filter((x) => x.logged && x.t.protein >= g.protein).length;
+
+    return `
+      <div class="sect">Last 7 days</div>
+      <div class="card">
+        <div class="wvals">${vals}</div>
+        <div class="barsarea">
+          <div class="goalline" style="bottom:${goalPct}%"></div>
+          <span class="goaltag" style="bottom:calc(${goalPct}% + 3px)">goal</span>
+          <div class="cols7">${bars}</div>
+        </div>
+        <div class="wmeta">${meta}</div>
+        <div class="legend"><i class="lg-cal">– –</i> calorie goal &nbsp;·&nbsp; <i class="lg-pro">●</i> protein goal hit</div>
+      </div>
+      <div class="stats">
+        <div class="stat cal"><b>${nf(avg('calories'))}</b><span>avg kcal</span></div>
+        <div class="stat pro"><b>${avg('protein')}g</b><span>avg protein</span></div>
+        <div class="stat"><b>${proteinHits}/7</b><span>protein hits</span></div>
+      </div>`;
+  }
+
+  function renderMonth() {
+    const now = new Date();
+    const todayKey = dateKey(now);
+    const y = now.getFullYear();
+    const m = now.getMonth();
+    const daysInMonth = new Date(y, m + 1, 0).getDate();
+    const offset = (new Date(y, m, 1).getDay() + 6) % 7;
+    const g = loadGoals();
+
+    const headers = ['M', 'T', 'W', 'T', 'F', 'S', 'S'].map((h) => `<header>${h}</header>`).join('');
+    let cells = '';
+    for (let i = 0; i < offset; i++) cells += '<div></div>';
+
+    const dayRows = [];
+    for (let day = 1; day <= daysInMonth; day++) {
+      const k = `${y}-${pad(m + 1)}-${pad(day)}`;
+      const es = entriesOn(k);
+      const t = totalsFor(es);
+      const logged = es.length > 0;
+      if (logged) dayRows.push({ k, t });
+      const future = k > todayKey;
+      const intensity = logged ? Math.min(1, t.calories / (g.calories || 1)) : 0;
+      const alpha = logged ? (0.15 + 0.75 * intensity).toFixed(2) : 0;
+      const cls = [
+        'cell',
+        logged ? 'logged' : '',
+        logged && intensity < 0.45 ? 'faint' : '',
+        logged && t.protein >= g.protein ? 'hit' : '',
+        k === todayKey ? 'today' : '',
+        future ? 'future' : '',
+      ].join(' ');
+      const tip = logged ? `${fmtNice(parseKey(k))} — ${nf(t.calories)} kcal, ${Math.round(t.protein)}g protein` : fmtNice(parseKey(k));
+      cells += `<button class="${cls}" style="--a:${alpha}" data-action="jump" data-key="${k}" title="${tip}" ${future ? 'disabled' : ''}><span>${day}</span></button>`;
+    }
+
+    const avg = (f) => (dayRows.length ? Math.round(dayRows.reduce((s, r) => s + r.t[f], 0) / dayRows.length) : 0);
+    const monthName = now.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+
+    return `
+      <div class="sect">${monthName}</div>
+      <div class="card">
+        <div class="cal7">${headers}${cells}</div>
+        <div class="legend">shade = calories vs goal &nbsp;·&nbsp; <i class="lg-pro">◯</i> ring = protein goal hit &nbsp;·&nbsp; tap a day to open it</div>
+      </div>
+      <div class="stats">
+        <div class="stat"><b>${dayRows.length}</b><span>days logged</span></div>
+        <div class="stat cal"><b>${nf(avg('calories'))}</b><span>avg kcal</span></div>
+        <div class="stat pro"><b>${avg('protein')}g</b><span>avg protein</span></div>
+      </div>
+      <button class="btn" data-action="export">Export all entries (CSV)</button>`;
+  }
+
+  function renderGoals() {
+    const g = loadGoals();
+    const field = (key, label, dot, unit) => `
+      <label>
+        <span class="gl"><i class="dot ${dot}"></i>${label}</span>
+        <div class="gfield"><input id="mt-goal-${key}" type="number" min="1" value="${g[key]}"/><b>${unit}</b></div>
+      </label>`;
+    return `
+      <div class="sect">Daily goals</div>
+      <div class="goalgrid">
+        ${field('calories', 'Calories', 'd-cal', 'kcal')}
+        ${field('protein', 'Protein', 'd-pro', 'g')}
+        ${field('carbs', 'Carbs', 'd-carb', 'g')}
+        ${field('fat', 'Fat', 'd-fat', 'g')}
+      </div>
+      <button class="btn primary" data-action="save-goals">Save goals</button>
+      <div class="sect" style="margin-top:8px">Data</div>
+      <div class="note">Entries are stored in this browser's localStorage on chatgpt.com. Clearing site data wipes them — export a CSV from the Month tab first.</div>
+      <button class="btn danger" data-action="clear">Delete all entries</button>`;
+  }
+
+  function render() {
+    const body = q('#mt-body');
+    if (!body) return;
+    qa('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === ui.tab));
+    body.innerHTML =
+      ui.tab === 'today' ? renderToday() :
+      ui.tab === 'week' ? renderWeek() :
+      ui.tab === 'month' ? renderMonth() :
+      renderGoals();
+  }
+
+  async function addFood() {
+    if (ui.busy) return;
+    const foodEl = q('#mt-food');
+    const gramsEl = q('#mt-grams');
+    const food = (foodEl?.value || '').trim();
+    const grams = Number(gramsEl?.value) || 0;
+    if (!food) {
+      setStatus('Type a food first.', 'err');
+      return;
+    }
+    ui.busy = true;
+    const addBtn = q('.addbtn');
+    if (addBtn) addBtn.disabled = true;
+    setStatus('Asking ChatGPT…', 'busy');
+    try {
+      const reply = await askChatGPT(buildPrompt(food, grams));
+      const macros = extractMacros(reply);
+      if (!macros) throw new Error("Couldn't read macros from the reply — try rewording the food.");
+      const now = new Date();
+      const entry = {
+        id: Date.now(),
+        date: ui.viewDate,
+        time: `${pad(now.getHours())}:${pad(now.getMinutes())}`,
+        ...macros,
+      };
+      const all = loadEntries();
+      all.push(entry);
+      saveEntries(all);
+      const where = ui.viewDate === dateKey(new Date()) ? '' : ` on ${fmtNice(parseKey(ui.viewDate))}`;
+      ui.busy = false;
+      setStatus(`Added ${macros.food} — ${nf(macros.calories)} kcal${where}`, 'ok');
+      render();
+    } catch (err) {
+      ui.busy = false;
+      setStatus(err.message || 'Something went wrong.', 'err');
+      render();
+    }
+  }
+
+  function saveGoalsFromInputs() {
+    const g = loadGoals();
+    ['calories', 'protein', 'carbs', 'fat'].forEach((k) => {
+      const v = Number(q(`#mt-goal-${k}`)?.value);
+      if (Number.isFinite(v) && v > 0) g[k] = Math.round(v);
+    });
+    saveGoals(g);
+    ui.tab = 'today';
+    setStatus('Goals saved.', 'ok');
+    render();
+  }
+
+  function exportCsv() {
+    const header = ['date', 'time', 'food', 'grams', 'calories', 'protein', 'carbs', 'fat', 'fiber'];
+    const rows = loadEntries()
+      .slice()
+      .sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')))
+      .map((e) => [e.date, e.time || '', e.food, e.grams, e.calories, e.protein, e.carbs, e.fat, e.fiber ?? 0]);
+    const csv = [header, ...rows]
+      .map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(','))
+      .join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+    a.download = `macro-log-${dateKey(new Date())}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  function togglePanel(force) {
+    const panel = q('#mt-panel');
+    if (!panel) return;
+    const show = force !== undefined ? force : panel.style.display !== 'flex';
+    panel.style.display = show ? 'flex' : 'none';
+    localStorage.setItem(OPEN_KEY, show ? '1' : '0');
+    if (show) render();
+  }
+
+  function mount() {
+    if (document.getElementById('mt-host')) return;
+
+    const host = document.createElement('div');
+    host.id = 'mt-host';
+    document.body.appendChild(host);
+    shadow = host.attachShadow({ mode: 'open' });
+
+    shadow.innerHTML = `
+      <style>${CSS}</style>
+      <button id="mt-pill"><span class="pillring"></span>Macros</button>
+      <div id="mt-panel">
+        <div class="head">
+          <div class="brand">
+            <span class="brandring"></span>
+            <div>
+              <div class="title">REHYANN</div>
+              <div class="subtitle">MACRO LOG</div>
+            </div>
+          </div>
+          <button class="xbtn" data-action="close" title="Close">✕</button>
+        </div>
+        <div class="tabs">
+          <button data-action="tab" data-tab="today">Today</button>
+          <button data-action="tab" data-tab="week">Week</button>
+          <button data-action="tab" data-tab="month">Month</button>
+          <button data-action="tab" data-tab="goals">Goals</button>
+        </div>
+        <div class="body" id="mt-body"></div>
+      </div>`;
+
+    q('#mt-pill').addEventListener('click', () => togglePanel());
+
+    const panel = q('#mt-panel');
+    panel.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-action]');
+      if (!btn) return;
+      const action = btn.dataset.action;
+      if (action === 'close') togglePanel(false);
+      else if (action === 'tab') { ui.tab = btn.dataset.tab; ui.status = null; render(); }
+      else if (action === 'day') { ui.viewDate = dateKey(addDays(parseKey(ui.viewDate), Number(btn.dataset.delta))); ui.status = null; render(); }
+      else if (action === 'jump') { ui.viewDate = btn.dataset.key; ui.tab = 'today'; ui.status = null; render(); }
+      else if (action === 'prefill') {
+        const f = q('#mt-food'), gr = q('#mt-grams');
+        if (f) f.value = btn.dataset.food || '';
+        if (gr) gr.value = btn.dataset.grams || '';
+        f?.focus();
+      }
+      else if (action === 'del') { saveEntries(loadEntries().filter((e) => String(e.id) !== btn.dataset.id)); render(); }
+      else if (action === 'add') addFood();
+      else if (action === 'save-goals') saveGoalsFromInputs();
+      else if (action === 'export') exportCsv();
+      else if (action === 'clear') {
+        if (confirm('Delete ALL logged entries? This cannot be undone.')) { saveEntries([]); render(); }
+      }
+    });
+
+    panel.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.target.id === 'mt-food' || ev.target.id === 'mt-grams')) {
+        ev.preventDefault();
+        addFood();
+      }
+    });
+
+    if (localStorage.getItem(OPEN_KEY) === '1') togglePanel(true);
+  }
+
+  if (document.body) mount();
+  else window.addEventListener('DOMContentLoaded', mount);
+})();
