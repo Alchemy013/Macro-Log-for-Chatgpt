@@ -4,7 +4,7 @@ A calorie & macro tracker that lives inside ChatGPT.
 
 Type `rajma rice, one bowl` → ChatGPT works out the macros → the panel logs it and keeps your running totals. Daily rings, weekly trends, a monthly heatmap. No API key, no account, no ads.
 
-![Rehyann Macro Log panel](assets/screenshot.png)
+<img width="368" height="765" alt="Macro ss" src="https://github.com/user-attachments/assets/afe6d71a-0ce4-4958-aa1c-a7f596fd596a" />
 
 ## Why
 
