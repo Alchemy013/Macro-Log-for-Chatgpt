@@ -494,7 +494,7 @@ input[type=number]{-moz-appearance:textfield;appearance:textfield}
         <button data-action="day" data-delta="1" ${isToday ? 'disabled' : ''} title="Next day">›</button>
       </div>
       <div class="composer">
-        <input id="mt-food" type="text" placeholder="Add food… e.g. rajma rice, one bowl" autocomplete="off"/>
+        <input id="mt-food" type="text" placeholder="e.g. rajma rice, one bowl" autocomplete="off"/>
         <div class="gwrap"><input id="mt-grams" type="number" min="1" placeholder="—" title="Grams (leave empty to let ChatGPT estimate a serving)"/><span>g</span></div>
         <button class="addbtn" data-action="add" ${ui.busy ? 'disabled' : ''} title="Add">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
